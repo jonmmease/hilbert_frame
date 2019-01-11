@@ -29,6 +29,23 @@ def _binary_2_int(bin_vec):
     return res
 
 
+@jit(nopython=True)
+def _hilbert_integer_to_transpose(p, h):
+    """Store a hilbert integer (`h`) as its transpose (`x`).
+    Args:
+        p (int): iterations to use in the hilbert curve
+        h (int): integer distance along hilbert curve
+    Returns:
+        x (list): transpose of h
+                  (n components with values between 0 and 2**p-1)
+    """
+    n = 2
+    h_bits = _int_2_binary(h, p * n)
+
+    x = [_binary_2_int(h_bits[i::n]) for i in range(n)]
+    return x
+
+
 @jit([int64(int64, int64, int64)], nopython=True)
 def _transpose_to_hilbert_integer(p, x, y):
     """Restore a hilbert integer (`h`) from its transpose (`x`).
@@ -50,6 +67,46 @@ def _transpose_to_hilbert_integer(p, x, y):
 
     h = _binary_2_int(concat)
     return h
+
+
+@jit(nopython=True)
+def coordinates_from_distance(p, h):
+    """Return the coordinates for a given hilbert distance.
+    Args:
+        p (int): iterations to use in the hilbert curve
+        h (int): integer distance along hilbert curve
+    Returns:
+        x (list): transpose of h
+                  (n components with values between 0 and 2**p-1)
+    """
+
+    n = 2
+    x = _hilbert_integer_to_transpose(p, h)
+    Z = 2 << (p-1)
+
+    # Gray decode by H ^ (H/2)
+    t = x[n-1] >> 1
+    for i in range(n-1, 0, -1):
+        x[i] ^= x[i-1]
+    x[0] ^= t
+
+    # Undo excess work
+    Q = 2
+    while Q != Z:
+        P = Q - 1
+        for i in range(n-1, -1, -1):
+            if x[i] & Q:
+                # invert
+                x[0] ^= P
+            else:
+                # exchange
+                t = (x[0] ^ x[i]) & P
+                x[0] ^= t
+                x[i] ^= t
+        Q <<= 1
+
+    # done
+    return x
 
 
 @vectorize([int64(int64, int64, int64)], nopython=True)
