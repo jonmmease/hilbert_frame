@@ -46,7 +46,9 @@ class HilbertFrame2D(object):
                        p=6,
                        npartitions=8,
                        shuffle=None,
-                       persist=False):
+                       persist=False,
+                       engine='auto',
+                       compression='default'):
 
         # Validate dirname
         if (not isinstance(dirname, string_types) or
@@ -115,7 +117,8 @@ Received value of type {typ}""".format(typ=type(df)))
                     side='right')
 
         # Save ddf to parquet
-        dd.to_parquet(ddf, os.path.join(dirname, 'frame.parquet'))
+        dd.to_parquet(ddf, os.path.join(dirname, 'frame.parquet'),
+                      engine=engine, compression=compression)
 
         # Save other properties as pickle file
         props = dict(
@@ -150,9 +153,9 @@ Received value of type {typ}""".format(typ=type(df)))
         self.partition_grid = props['partition_grid']
 
         # Compute simple derived properties
-        N = 2
+        n = 2
         self.side_length = 2 ** self.p
-        self.max_distance = 2 ** (N * self.p) - 1
+        self.max_distance = 2 ** (n * self.p) - 1
         self.x_width = self.x_range[1] - self.x_range[0]
         self.y_width = self.y_range[1] - self.y_range[0]
         self.x_bin_width = self.x_width / self.side_length
@@ -190,12 +193,23 @@ Received value of type {typ}""".format(typ=type(df)))
             slice(*query_x_range_coord), slice(*query_y_range_coord)]
 
         distance_ranges = []
+        prev_partition = None
         for p in query_partitions:
             ds = distance_query[partition_query == p]
-            distance_ranges.append((ds.min(), ds.max()))
+            ds_min, ds_max = ds.min(), ds.max()
+
+            if (p - 1 == prev_partition or
+                    distance_ranges and distance_ranges[-1][1] == ds_min-1):
+                # Merge consecutive partitions to reduce the number of loc
+                # operations needed
+                distance_ranges[-1] = (distance_ranges[-1][0], ds_max)
+            else:
+                distance_ranges.append((ds_min, ds_max))
+
+            prev_partition = p
 
         partition_subframes = []
-        for p, d_range in zip(query_partitions, distance_ranges):
+        for d_range in distance_ranges:
             dmin, dmax = d_range
             partition_subframes.append(self.ddf.loc[dmin:dmax])
 
