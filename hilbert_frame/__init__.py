@@ -1,3 +1,7 @@
+import copy
+
+from fastparquet import ParquetFile, parquet_thrift
+from fastparquet.writer import write_common_metadata
 from six import string_types
 
 import hilbert_frame.hilbert_curve as hc
@@ -6,7 +10,7 @@ import pandas as pd
 import dask.dataframe as dd
 import os
 import shutil
-import pickle
+import json
 
 
 def data2coord(vals, val_range, side_length):
@@ -18,7 +22,8 @@ def data2coord(vals, val_range, side_length):
             ).astype(np.int64).clip(0, side_length - 1)
 
 
-def compute_distance(df, x, y, p, x_range, y_range, side_length):
+def compute_distance(df, x, y, p, x_range, y_range):
+    side_length = 2 ** p
     x_coords = data2coord(df[x], x_range, side_length)
     y_coords = data2coord(df[y], y_range, side_length)
     return hc.distance_from_coordinates(p, x_coords, y_coords)
@@ -40,28 +45,25 @@ class HilbertFrame2D(object):
 
     @staticmethod
     def from_dataframe(df,
-                       dirname,
+                       filename,
                        x='x',
                        y='y',
-                       p=6,
-                       npartitions=8,
+                       p=10,
+                       npartitions=None,
                        shuffle=None,
                        persist=False,
                        engine='auto',
                        compression='default'):
 
         # Validate dirname
-        if (not isinstance(dirname, string_types) or
-                not dirname.endswith('.hframe')):
+        if (not isinstance(filename, string_types) or
+                not filename.endswith('.parquet')):
             raise ValueError(
-                'dirname must be a string ending with a .hframe extension')
+                'filename must be a string ending with a .parquet extension')
 
         # Remove any existing directory
-        if os.path.exists(dirname):
-            shutil.rmtree(dirname)
-
-        # Create output directory
-        os.mkdir(dirname)
+        if os.path.exists(filename):
+            shutil.rmtree(filename)
 
         # Normalize to dask dataframe
         if isinstance(df, pd.DataFrame):
@@ -73,40 +75,80 @@ class HilbertFrame2D(object):
 df must be a pandas or dask DataFrame instance.
 Received value of type {typ}""".format(typ=type(df)))
 
-        # Only support 2D spaces for now
-        n = 2
-        # TODO: validate x/y/p/npartitions/persist
-
-        side_length = 2 ** p
+        # Compute npartitions if needed
+        if npartitions is None:
+            # Make partitions of ~8 million rows with a minimum of 8
+            # partitions
+            max(int(np.ceil(len(df) / 2**23)), 8)
 
         # Compute data extents
         extents = ddf.map_partitions(
             compute_extents, x, y).compute()
-        x_range = (extents['x_min'].min(), extents['x_max'].max())
-        y_range = (extents['y_min'].min(), extents['y_max'].max())
+
+        x_range = (float(extents['x_min'].min()),
+                   float(extents['x_max'].max()))
+
+        y_range = (float(extents['y_min'].min()),
+                   float(extents['y_max'].max()))
 
         # Compute distance of points in integer hilbert space
         ddf = ddf.assign(distance=ddf.map_partitions(
             compute_distance, x=x, y=y, p=p,
-            x_range=x_range, y_range=y_range, side_length=side_length))
+            x_range=x_range, y_range=y_range))
 
         # Set index to distance
         ddf = ddf.set_index('distance',
                             npartitions=npartitions,
                             shuffle=shuffle)
 
-        # Build distance grid
-        distance_grid = np.zeros([side_length] * 2, dtype='int')
-        for i in range(side_length):
-            for j in range(side_length):
-                distance_grid[i, j] = (
-                    hc.distance_from_coordinates(p, i, j))
-
         # Build partitions grid
         # Uses distance divisions computed above, but does not revisit data
-        search_divisions = np.array(
-            list(ddf.divisions[1:-1]))
+        distance_divisions = [int(d) for d in ddf.divisions]
 
+        # Save other properties as custom metadata in the parquet file
+        props = dict(
+            version='1.0',
+            x=x,
+            y=y,
+            p=p,
+            distance_divisions=distance_divisions,
+            x_range=x_range,
+            y_range=y_range,
+        )
+
+        # Drop distance index
+        ddf = ddf.reset_index(drop=True)
+
+        # Save ddf to parquet
+        dd.to_parquet(ddf, filename, engine=engine, compression=compression)
+
+        # Open file
+        pf = ParquetFile(filename)
+
+        # Add a new property to the file metadata
+        new_fmd = copy.copy(pf.fmd)
+        new_kv = parquet_thrift.KeyValue()
+        new_kv.key = 'hilbert_frame'
+        new_kv.value = json.dumps(props)
+        new_fmd.key_value_metadata.append(new_kv)
+
+        # Overwrite file metadata
+        fn = os.path.join(filename, '_metadata')
+        write_common_metadata(fn, new_fmd, no_row_groups=False)
+
+        fn = os.path.join(filename, '_common_metadata')
+        write_common_metadata(fn, new_fmd)
+
+        # Construct HilbertFrame2D from file
+        return HilbertFrame2D(filename, persist=persist)
+
+    @staticmethod
+    def build_partition_grid(distance_grid, dask_divisions, p):
+
+        search_divisions = np.array(
+            list(dask_divisions[1:-1]))
+
+        side_length = 2 ** p
         partition_grid = np.zeros([side_length] * 2, dtype='int')
         for i in range(side_length):
             for j in range(side_length):
@@ -115,33 +157,26 @@ Received value of type {typ}""".format(typ=type(df)))
                     distance_grid[i, j],
                     sorter=None,
                     side='right')
+        return partition_grid
 
-        # Save ddf to parquet
-        dd.to_parquet(ddf, os.path.join(dirname, 'frame.parquet'),
-                      engine=engine, compression=compression)
+    @staticmethod
+    def build_distance_grid(p):
+        side_length = 2 ** p
+        distance_grid = np.zeros([side_length] * 2, dtype='int')
+        for i in range(side_length):
+            for j in range(side_length):
+                distance_grid[i, j] = (
+                    hc.distance_from_coordinates(p, i, j))
+        return distance_grid
 
-        # Save other properties as pickle file
-        props = dict(
-            x=x,
-            y=y,
-            p=p,
-            npartitions=npartitions,
-            x_range=x_range,
-            y_range=y_range,
-            distance_grid=distance_grid,
-            partition_grid=partition_grid
-        )
+    def __init__(self, filename, persist=False):
 
-        with open(os.path.join(dirname, 'props.pkl'), 'wb') as f:
-            pickle.dump(props, f)
+        # Open hilbert properties
+        # Reopen file
+        pf = ParquetFile(filename)
 
-        # Construct HilbertFrame2D from directory
-        return HilbertFrame2D(dirname, persist=persist)
-
-    def __init__(self, dirname, persist=False):
-
-        with open(os.path.join(dirname, 'props.pkl'), 'rb') as f:
-            props = pickle.load(f)
+        # Access custom metadata
+        props = json.loads(pf.key_value_metadata['hilbert_frame'])
 
         # Set all props as attributes
         self.x = props['x']
@@ -149,8 +184,12 @@ Received value of type {typ}""".format(typ=type(df)))
         self.p = props['p']
         self.x_range = props['x_range']
         self.y_range = props['y_range']
-        self.distance_grid = props['distance_grid']
-        self.partition_grid = props['partition_grid']
+        self.distance_divisions = props['distance_divisions']
+
+        # Compute grids
+        self.distance_grid = HilbertFrame2D.build_distance_grid(self.p)
+        self.partition_grid = HilbertFrame2D.build_partition_grid(
+            self.distance_grid, self.distance_divisions, self.p)
 
         # Compute simple derived properties
         n = 2
@@ -162,7 +201,7 @@ Received value of type {typ}""".format(typ=type(df)))
         self.y_bin_width = self.y_width / self.side_length
 
         # Read parquet file
-        self.ddf = dd.read_parquet(os.path.join(dirname, 'frame.parquet'))
+        self.ddf = dd.read_parquet(filename)
 
         # Persist if requested
         if persist:
@@ -189,32 +228,21 @@ Received value of type {typ}""".format(typ=type(df)))
 
         query_partitions = sorted(np.unique(partition_query))
 
-        distance_query = self.distance_grid[
-            slice(*query_x_range_coord), slice(*query_y_range_coord)]
-
-        distance_ranges = []
-        prev_partition = None
-        for p in query_partitions:
-            ds = distance_query[partition_query == p]
-            ds_min, ds_max = ds.min(), ds.max()
-
-            if (p - 1 == prev_partition or
-                    distance_ranges and distance_ranges[-1][1] == ds_min-1):
-                # Merge consecutive partitions to reduce the number of loc
-                # operations needed
-                distance_ranges[-1] = (distance_ranges[-1][0], ds_max)
-            else:
-                distance_ranges.append((ds_min, ds_max))
-
-            prev_partition = p
-
-        partition_subframes = []
-        for d_range in distance_ranges:
-            dmin, dmax = d_range
-            partition_subframes.append(self.ddf.loc[dmin:dmax])
-
-        if partition_subframes:
-            query_frame = dd.concat(partition_subframes)
+        if query_partitions:
+            partition_dfs = [self.ddf.get_partition(p) for p in
+                             query_partitions]
+            query_frame = dd.concat(partition_dfs)
             return query_frame
         else:
             return self.ddf.loc[1:0]
+
+    @property
+    def hilbert_distance(self):
+        x = self.x
+        y = self.y
+        p = self.p
+        x_range = self.x_range
+        y_range = self.y_range
+        return self.ddf.map_partitions(
+            compute_distance, x=x, y=y, p=p, x_range=x_range, y_range=y_range)
+
